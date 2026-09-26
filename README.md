@@ -72,6 +72,69 @@ cp conf.env.example conf.env && vim conf.env      # 至少改密码和网络
 把 `expected-9000.conf` cp 回 `/etc/pve/qemu-server/` 只会得到一个
 指向不存在磁盘卷的坏 VM —— VM 配置必须和真实 LVM 卷一起由脚本生成。
 
+## 派生产物：不要手工编辑这三个文件
+
+| 文件 | 来源 | 重新生成 |
+|---|---|---|
+| `conf.env.example` | `conf.env`（脱敏后） | `./make-dist.sh` |
+| `reference/expected-9000.conf` | `/etc/pve/qemu-server/9000.conf`（脱敏后） | `./make-dist.sh` |
+| `reference/expected-node-config` | `/etc/pve/nodes/<node>/config` | `./make-dist.sh` |
+
+改了 `conf.env` 或重建模板后跑一次，三个文件就同步了：
+
+```bash
+./make-dist.sh            # 生成 + 自动提交
+./make-dist.sh --check    # 只看有没有过期（严格只读，不写文件）
+./make-dist.sh --no-commit
+```
+
+`--check` 用在 CI 或提交前：有过期就退出码 1。
+
+## 网络参数是自动推导的
+
+`conf.env` 里这五个键由 `bootstrap.sh` 按本机实际情况**推导并写回**：
+
+```
+GATEWAY  DNS  SEARCH_DOMAIN  IP_POOL  BUILD_IP
+```
+
+由 `conf.env` 里的 `AUTO_DERIVE` 声明。**想钉死某个值，就把它从 `AUTO_DERIVE` 里删掉** ——
+这样"哪些是自动的、哪些是我定的"一眼可见，也不用在脚本里维护一份出厂默认值表
+（那种表迟早会和 conf.env 脱节）。
+
+```bash
+./bootstrap.sh --check    # 只读预览，会标出「待写入」的项
+./bootstrap.sh            # 真正写回
+```
+
+推导规则：
+
+| 键 | 来源 |
+|---|---|
+| `GATEWAY` | 网桥同网段的默认网关；取不到用该网段第一个地址 |
+| `DNS` | `resolv.conf` 第一个**非 CGNAT** 的 IPv4 nameserver；取不到用 `GATEWAY` |
+| `SEARCH_DOMAIN` | `resolv.conf` 的 search 域，跳过 `*.ts.net` |
+| `IP_POOL` | 网桥网段可用地址，跳过前后各 10 个，最多 100 个 |
+| `BUILD_IP` | `IP_POOL` 的第一个 |
+
+### ⚠️ 为什么要跳过 CGNAT 段
+
+**宿主装了 Tailscale 时，`/etc/resolv.conf` 里是 `100.100.100.100`（MagicDNS）。**
+直接照抄给 VM 是错的 —— guest 没装 Tailscale，根本访问不到那个地址，
+结果就是 **VM 能 ping 通但什么都解析不了**。这种故障很隐蔽，因为网络"看起来是通的"。
+
+所以推导时会跳过 `100.64.0.0/10`（CGNAT，Tailscale 和部分运营商 NAT 都在这段），
+并跳过 `*.ts.net` 搜索域。本机实测：
+
+```
+resolv.conf: nameserver 100.100.100.100        ← Tailscale MagicDNS，不能下发
+            search taila5f454.ts.net ...      ← Tailscale 域，不能下发
+推导结果:   DNS = 192.168.0.1（回退到网关）
+            SEARCH_DOMAIN = randommaker.local（跳过 ts.net 后取到的）
+```
+
+没装 Tailscale 的机器上这些过滤不生效，行为不变。
+
 ## 凭据在哪 / 提交安全
 
 根目录的 `.gitignore` 只忽略 `.env` / `*.key` / `id_rsa`，**覆盖不到 `pvestudio/conf.env`**，
@@ -119,6 +182,7 @@ grep 会把它当成命令行选项，整条规则静默失效，脚本还会报
 ├── new-vm.sh              从模板一键建机
 ├── smoke-test.sh          冒烟测试：建一台临时 VM 跑 28 项验证后销毁
 ├── tune-host.sh           宿主内存气球设置（bootstrap 内部调，也可单独跑）
+├── make-dist.sh           同步派生产物（conf.env.example / reference/*）
 ├── lib/common.sh          公共函数（IP 分配、SSH 等待、日志）
 ├── guest/provision.sh     guest 内部的定制脚本（装包 / SSH / 系统调优）
 └── reference/             产出物的期望值快照（比对用，勿 cp 回去，详见其 README）

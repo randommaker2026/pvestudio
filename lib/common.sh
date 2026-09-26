@@ -315,6 +315,23 @@ pick_free_ip() {  # pick_free_ip <pool> [要排除的IP...]
     return 1
 }
 
+# IP_POOL 里有几个地址当前在 ARP 表里有条目（= 有人在用）。
+#
+# 静态分配的地址如果落在路由器的 DHCP 段里，就可能出现"今天空闲、明天被 DHCP
+# 发给别人"的冲突 —— 分配时刻探测不出来（ip_is_free 只能看到当下）。
+# 这个函数给 bootstrap --check 用来提示风险，不负责解决。
+pool_arp_hits() {  # pool_arp_hits <start-end> [网桥]
+    local range="$1" br="${2:-$BRIDGE}"
+    local lo="${range%%-*}" hi="${range#*-}"
+    local lo_i hi_i
+    lo_i=$(ip2int "$lo"); hi_i=$(ip2int "$hi")
+    local i n=0
+    for (( i=lo_i; i<=hi_i && i-lo_i<=2048; i++ )); do
+        ip neigh show to "$(int2ip "$i")" dev "$br" 2>/dev/null | grep -q lladdr && n=$(( n + 1 ))
+    done
+    echo "$n"
+}
+
 # ---------- 其他 ----------
 
 # 从 qga 的 network-get-interfaces 输出里提取第一个非回环 IPv4。

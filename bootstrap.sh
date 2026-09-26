@@ -259,6 +259,14 @@ if [ "$MODE" = "check" ]; then
     else
         info "标了「待写入」的项与 conf.env 现状不同 —— 跑 ./bootstrap.sh 会自动改写"
     fi
+
+    # 静态 IP 池和路由器 DHCP 段重叠的风险
+    local_hits=$(pool_arp_hits "$IP_POOL" "$BRIDGE")
+    if [ "${local_hits:-0}" -gt 0 ]; then
+        warn1 "IP_POOL ($IP_POOL) 里有 $local_hits 个地址当前有设备在用"
+        warn1 "  若这个范围和路由器的 DHCP 段重叠，静态分配的地址将来可能被 DHCP 发给别人"
+        warn1 "  稳妥做法: 把 AUTO_DERIVE 里的 IP_POOL 删掉，手动填一个确定在 DHCP 段之外的段"
+    fi
     echo
     if [ "$PROBLEMS" -gt 0 ]; then
         err "体检未通过: $PROBLEMS 个问题 / $WARNINGS 个提醒"
