@@ -1,0 +1,11 @@
+# conf.env 含明文密码（CI_PASSWORD），绝不能进版本库。
+# 模板结构用 conf.env.example 代替，新机器上: cp conf.env.example conf.env
+conf.env
+
+# 构建产物 / 运行时
+*.log
+reference/*.actual
+
+# 编辑器
+*~
+.*.swp
