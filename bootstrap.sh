@@ -43,6 +43,107 @@ bad()  { err "$1"; PROBLEMS=$((PROBLEMS + 1)); }
 warn1() { warn "$1"; WARNINGS=$((WARNINGS + 1)); }
 
 # ==============================================================================
+#  网络参数自动推导
+# ==============================================================================
+# 只推导 conf.env 的 AUTO_DERIVE 里列出的键。想钉死某个值就把它从 AUTO_DERIVE
+# 删掉 —— 这样"哪些是自动的、哪些是我定的"一目了然，也不需要在脚本里维护
+# 一份"出厂默认值"表（那份表迟早会和 conf.env 脱节）。
+
+derive_net_params() {   # derive_net_params <只读:1 表示只报告不写回>
+    local readonly="${1:-0}"
+    local changed=0 differing=0 k cur new
+
+    local CIDR; CIDR=$(bridge_cidr "$BRIDGE")
+    if [ -z "$CIDR" ]; then
+        warn "网桥 $BRIDGE 上没有全局 IPv4，跳过网络参数推导"
+        return 1
+    fi
+    local baddr="${CIDR%%/*}" pfx="${CIDR##*/}"
+    local net; net=$(cidr_network "$baddr" "$pfx")
+    local bcast; bcast=$(cidr_broadcast "$baddr" "$pfx")
+
+    # --- GATEWAY ---
+    new=$(default_gw_in_subnet "$CIDR")
+    [ -z "$new" ] && new=$(int2ip $(( net + 1 )))
+    DERIVED_GATEWAY="$new"
+
+    # --- DNS ---
+    # 关键: 跳过 CGNAT 段(100.64.0.0/10)。宿主装了 Tailscale 时 resolv.conf 里
+    # 是 100.100.100.100(MagicDNS)，guest 没装 Tailscale 就访问不到，
+    # 下发过去等于没有 DNS。这种坑很隐蔽 —— VM 能 ping 通但什么都解析不了。
+    new=""
+    local ns
+    while read -r ns; do
+        [ -n "$ns" ] || continue
+        case "$ns" in *:*) continue ;; esac          # 跳过 IPv6
+        is_cgnat "$ns" && continue                    # 跳过 Tailscale/CGN
+        new="$ns"; break
+    done < <(awk '/^[[:space:]]*nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null)
+    [ -z "$new" ] && new="$DERIVED_GATEWAY"
+    DERIVED_DNS="$new"
+    DNS_FELLBACK=0
+    awk '/^[[:space:]]*nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null \
+        | grep -qE '^(127\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|::1)' \
+        && DNS_FELLBACK=1
+
+    # --- SEARCH_DOMAIN ---
+    # 跳过 *.ts.net(Tailscale MagicDNS 域)，guest 上解析不了也没意义
+    new=""
+    for d in $(awk '/^[[:space:]]*search/ { $1=""; sub(/^[[:space:]]+/, ""); print }' \
+                 /etc/resolv.conf 2>/dev/null); do
+        is_ts_domain "$d" && continue
+        new="$d"; break
+    done
+    DERIVED_SEARCH_DOMAIN="$new"
+
+    # --- IP_POOL ---
+    # 可用地址 = 网络地址+1 .. 广播地址-1，跳过前后各 10 个，最多 100 个
+    local lo=$(( net + 11 )) hi=$(( bcast - 11 ))
+    [ "$hi" -lt "$lo" ] && { hi=$lo; }               # 极小网段兜底
+    [ $(( hi - lo + 1 )) -gt 100 ] && hi=$(( lo + 99 ))
+    DERIVED_IP_POOL="$(int2ip "$lo")-$(int2ip "$hi")"
+
+    # --- BUILD_IP ---
+    DERIVED_BUILD_IP="${DERIVED_IP_POOL%%-*}"
+
+    # --- 报告 + 按需写回 ---
+    info "网桥 $BRIDGE = $CIDR  →  可用段 $(int2ip $(( net + 1 ))) - $(int2ip $(( bcast - 1 )))"
+    [ "$DNS_FELLBACK" -eq 1 ] && warn "resolv.conf 里只有 Tailscale/CGN 的 DNS，DNS 回退用网关 $DERIVED_GATEWAY"
+
+    for k in GATEWAY DNS SEARCH_DOMAIN IP_POOL BUILD_IP; do
+        case " $AUTO_DERIVE " in
+            *" $k "*) ;;
+            *) printf '      %-14s 手动固定，不推导\n' "$k"; continue ;;
+        esac
+        cur="${!k}"
+        new="${!k}"
+        eval "new=\$DERIVED_$k"
+        if [ "$cur" = "$new" ]; then
+            printf '      %-14s %s\n' "$k" "$new"
+        else
+            differing=$(( differing + 1 ))
+            if [ "$readonly" -eq 0 ]; then
+                printf '      %-14s %s → %s   已写入\n' "$k" "$cur" "$new"
+            else
+                printf '      %-14s %s → %s   待写入\n' "$k" "$cur" "$new"
+            fi
+            if [ "$readonly" -eq 0 ]; then
+                if grep -qE "^${k}=" "$CONF_FILE"; then
+                    sed -i "s|^${k}=.*|${k}=${new}|" "$CONF_FILE"
+                else
+                    printf '%s=%s\n' "$k" "$new" >> "$CONF_FILE"
+                fi
+                changed=1
+            fi
+        fi
+    done
+
+    # 返回值: 0 = 正常(已写回或本就一致) / 2 = 只读模式下存在差异
+    [ "$readonly" -eq 1 ] && [ "$differing" -gt 0 ] && return 2
+    return 0
+}
+
+# ==============================================================================
 step "1/6  环境体检"
 # ==============================================================================
 require_root
@@ -87,12 +188,13 @@ fi
 if bridge_exists "$BRIDGE"; then
     BADDR=$(ip -4 -o addr show dev "$BRIDGE" 2>/dev/null | grep -oE 'inet [0-9.]+' | cut -d' ' -f2 || true)
     pass "网桥 $BRIDGE 存在${BADDR:+（本机 $BADDR）}"
-    # conf.env 里的静态网段是否和网桥同网段
+    # 静态网段是否和网桥同网段（真正的修复在 derive_net_params，这里先报个警）
     if [ -n "$BADDR" ] && [ -n "$GATEWAY" ]; then
         b3=$(echo "$BADDR" | cut -d. -f1-3)
         g3=$(echo "$GATEWAY" | cut -d. -f1-3)
         if [ "$b3" != "$g3" ]; then
-            warn1 "conf.env 的 GATEWAY=$GATEWAY 与网桥 $BRIDGE 的 $BADDR 不同网段，静态 IP 可能不通"
+            warn1 "conf.env 的 GATEWAY=$GATEWAY 与网桥 $BRIDGE 的 $BADDR 不同网段"
+            warn1 "  跑 ./bootstrap.sh 会自动改成推导值（也可从 conf.env 的 AUTO_DERIVE 里删掉 GATEWAY 来钉死）"
         fi
     fi
 else
@@ -151,6 +253,12 @@ else
 fi
 
 if [ "$MODE" = "check" ]; then
+    step "网络参数推导（只读预览，不会改 conf.env）"
+    if derive_net_params 1; then
+        info "conf.env 里的网络参数已经和本机一致"
+    else
+        info "标了「待写入」的项与 conf.env 现状不同 —— 跑 ./bootstrap.sh 会自动改写"
+    fi
     echo
     if [ "$PROBLEMS" -gt 0 ]; then
         err "体检未通过: $PROBLEMS 个问题 / $WARNINGS 个提醒"
@@ -168,6 +276,16 @@ fi
 # ==============================================================================
 step "2/6  准备输入"
 # ==============================================================================
+# ---- 网络参数：按本机实际情况推导并回写 conf.env ----
+# 换机器时这几个值原本要手改，现在自动完成。
+info "按本机网络推导 AUTO_DERIVE 里的键: $AUTO_DERIVE"
+if derive_net_params 0; then
+    ok "网络参数已与本机对齐"
+else
+    warn "网络参数推导被跳过（网桥 $BRIDGE 上没有全局 IPv4？）"
+    warn1 "静态 IP 的 VM 可能上不了网，确认 conf.env 里的 GATEWAY/DNS/IP_POOL"
+fi
+
 # ---- SSH 密钥 ----
 if [ "$NEED_KEY" -eq 1 ]; then
     KEYDIR=$(dirname "$SSH_KEY_FILE")

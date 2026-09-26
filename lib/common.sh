@@ -135,6 +135,94 @@ wait_cmd() {  # wait_cmd <user> <ip> <timeout_s> <描述> -- <cmd...>
     done
 }
 
+# ---------- IP / CIDR 运算 ----------
+# 推导网络参数要用。全用整数算，避免依赖 python/ipcalc。
+
+ip2int() {  # 192.168.0.250 -> 3232235770
+    local IFS=.
+    read -r a b c d <<< "$1"
+    echo $(( a*16777216 + b*65536 + c*256 + d ))
+}
+
+int2ip() {  # 3232235770 -> 192.168.0.250
+    local i="$1"
+    printf '%d.%d.%d.%d' \
+        $(( (i/16777216) % 256 )) $(( (i/65536) % 256 )) \
+        $(( (i/256) % 256 ))     $(( i % 256 ))
+}
+
+mask2int() {  # 前缀长度 -> 掩码整数。 24 -> 4294967040
+    local pfx="$1" m=0 i
+    [ "$pfx" -eq 0 ] && { echo 0; return; }
+    for (( i=0; i<32; i++ )); do
+        [ "$i" -lt "$pfx" ] && m=$(( m | (1 << (31 - i)) ))
+    done
+    echo "$m"
+}
+
+cidr_network() {  # 192.168.0.250/24 -> 3232235776
+    local ip="$1" pfx="$2"
+    echo $(( $(ip2int "$ip") & $(mask2int "$pfx") ))
+}
+
+cidr_broadcast() {  # 192.168.0.250/24 -> 3232236031
+    local ip="$1" pfx="$2"
+    echo $(( $(ip2int "$ip") | (0xFFFFFFFF ^ $(mask2int "$pfx")) ))
+}
+
+# 网桥上第一个非环回 IPv4（带前缀长度）。取不到就返回空。
+bridge_cidr() {  # bridge_cidr <网桥名>
+    ip -4 -o addr show dev "$1" scope global 2>/dev/null \
+        | grep -oE 'inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+        | head -1 | awk '{print $2}'
+}
+
+# 同一子网内的默认网关；不在同一子网就返回空
+default_gw_in_subnet() {  # default_gw_in_subnet <本机CIDR>
+    local cidr="$1" ip pfx
+    ip="${cidr%%/*}"; pfx="${cidr##*/}"
+    local net; net=$(cidr_network "$ip" "$pfx")
+    local gw
+    gw=$(ip -4 route show default 2>/dev/null | awk '/^default/{print $3; exit}')
+    [ -n "$gw" ] || return 0
+    local gwnet; gwnet=$(cidr_network "$gw" "$pfx")
+    [ "$gwnet" = "$net" ] && echo "$gw"
+    return 0
+}
+
+ip_in_cidr() {  # ip_in_cidr <ip> <cidr，如 100.64.0.0/10>
+    local ip="$1" cidr="$2"
+    local m; m=$(cidr_network "$cidr" "${cidr##*/}")
+    [ $(( $(ip2int "$ip") & $(mask2int "${cidr##*/}") )) -eq "$m" ]
+}
+
+# CGNAT 段 100.64.0.0/10：Tailscale / 部分运营商 NAT 网关都在这里。
+# 宿主若装了 Tailscale，/etc/resolv.conf 的 nameserver 往往就是 100.100.100.100
+# （MagicDNS）。把它当 DNS 下发给 VM 是错的 —— guest 没装 Tailscale，根本访问不到，
+# 结果就是 guest 完全无法解析域名。所以推导时要跳过这一段。
+is_cgnat() {
+    ip_in_cidr "$1" "100.64.0.0/10"
+}
+
+# Tailscale MagicDNS 的搜索域形如 <machine>.ts.net，同样不能下发给 guest。
+is_ts_domain() {
+    case "$1" in
+        *.ts.net|ts.net) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 从 resolv.conf 取第一个非环回 nameserver
+resolv_nameserver() {
+    awk '/^[[:space:]]*nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null \
+        | grep -vE '^127\.|^::1$' || true
+}
+
+resolv_search() {
+    awk '/^[[:space:]]*search/ { $1=""; sub(/^[[:space:]]+/, ""); print; exit }' \
+        /etc/resolv.conf 2>/dev/null | tr -s ' ' | cut -d' ' -f1 || true
+}
+
 # ---------- IP 工具 ----------
 ip_in_pool() {  # ip_in_pool <ip> <start-end>
     local ip="$1" range="${2%-*}" start="${2%-*}" end="${2#*-}"
