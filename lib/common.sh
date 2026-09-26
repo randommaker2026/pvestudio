@@ -15,7 +15,20 @@ PVE_NODE="$(basename "${PVE_NODE:-}")"
 : "${PVE_NODE:=$(hostname)}"
 
 if [ ! -f "$CONF_FILE" ]; then
+    # 全新 clone 里没有这个文件是正常的 —— 它含凭据，被 .gitignore 排除了。
+    # 第一次用的人一定会撞上这里，所以把下一步直接写出来。
     echo "找不到配置文件: $CONF_FILE" >&2
+    if [ -f "$SCRIPT_DIR/conf.env.example" ]; then
+        echo "" >&2
+        echo "  首次使用先复制一份模板并改掉里面的密码:" >&2
+        echo "" >&2
+        echo "      cp $SCRIPT_DIR/conf.env.example $CONF_FILE" >&2
+        echo "      vi  $CONF_FILE      # 至少改 CI_PASSWORD" >&2
+        echo "" >&2
+        echo "  然后跑 ./bootstrap.sh --check 体检" >&2
+    else
+        echo "  （连 conf.env.example 都没有，仓库可能不完整）" >&2
+    fi
     exit 1
 fi
 # shellcheck disable=SC1090

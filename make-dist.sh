@@ -34,12 +34,35 @@ require_root
 
 # ---------- 脱敏规则 ----------
 # 只脱敏确实敏感的两类，其它一律原样保留（保留可读性才有参考价值）
+#
+# ⚠️ 占位符必须【带引号】。写成 CI_PASSWORD=<改成你自己的密码> 的话，
+#    bash 会把 < 当成输入重定向，conf.env.example 直接语法错误 ——
+#    而这个错误只在"全新 clone 后第一次 source"时才暴露，
+#    在生成它的机器上永远看不到（那份是脱敏前的真配置）。
+#    所以下面生成完会真的 source 一遍验证。
 sanitize_conf_env() {
     sed -E \
-        -e "s/^(CI_PASSWORD=).*/\1<改成你自己的密码>/" \
-        -e "s/^(SSH_KEY_FILE=).*/\1<你的 SSH 私钥路径>/" \
-        -e "s|^(SSH_PUBKEY_FILE=).*|\1<你的 SSH 公钥路径>|" \
+        -e "s/^(CI_PASSWORD=).*/\1'<改成你自己的密码>'/" \
+        -e "s/^(SSH_KEY_FILE=).*/\1'<你的 SSH 私钥路径>'/" \
+        -e "s|^(SSH_PUBKEY_FILE=).*|\1'<你的 SSH 公钥路径>'|" \
         "$CONF_FILE"
+}
+
+# 生成物必须是能被 bash 正确 source 的 —— conf.env 是被 source 的，
+# 语法错误会让所有脚本以一个看不懂的方式挂掉。
+verify_sourceable() {  # verify_sourceable <文件>
+    local f="$1" err
+    err=$(bash -n "$f" 2>&1) || {
+        err "$f 语法错误，生成物不可用:"
+        printf '%s\n' "$err" | sed 's/^/      /' >&2
+        return 1
+    }
+    # bash -n 只查语法；再实际 source 一次，抓重定向/命令执行类问题
+    if ! ( set +u; source "$f" >/dev/null 2>&1 ); then
+        err "$f 能通过语法检查但 source 时失败（占位符可能含 shell 元字符）"
+        return 1
+    fi
+    return 0
 }
 
 sanitize_vm_conf() {
@@ -88,6 +111,10 @@ gen() {  # gen <目标文件> <生成命令...>
 
 step "1/4  conf.env → conf.env.example"
 gen "$SCRIPT_DIR/conf.env.example" sanitize_conf_env
+if ! verify_sourceable "$SCRIPT_DIR/conf.env.example"; then
+    die "conf.env.example 生成有问题，已中止（不会提交坏文件）"
+fi
+ok "conf.env.example 可被 source（新用户 clone 下来就能用）"
 
 step "2/4  模板配置 → reference/expected-$TPL_VMID.conf"
 VMCONF="/etc/pve/qemu-server/$TPL_VMID.conf"
